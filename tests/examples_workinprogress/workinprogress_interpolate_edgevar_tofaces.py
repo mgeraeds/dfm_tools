@@ -7,6 +7,7 @@ Created on Thu Apr 13 14:04:56 2023
 
 import os
 import dfm_tools as dfmt
+import xarray as xr
 
 dir_testinput = r'c:\DATA\dfm_tools_testdata'
 
@@ -36,6 +37,16 @@ varn_fnc = mesh2d_var.attrs['face_node_connectivity']
 dimn_maxfn = mesh2d_var.attrs['max_face_nodes_dimension']
 dimn_edges = uds.grid.edge_dimension
 
+# > Get face-edge-connectivity variable name + edge-node-connectivity
+varn_fnc = uds.grid.to_dataset().mesh2d.attrs['face_node_connectivity']
+varn_enc = uds.grid.to_dataset().mesh2d.attrs['edge_node_connectivity']
+varn_fec = 'face_edge_connectivity'
+
+# > Get face-edge-connectivity in xarray-format
+face_edges = xr.DataArray(data=uds.grid.face_edge_connectivity, dims=['mesh2d_nFaces', dimn_maxfn], coords=dict(
+    face_edge_connectivity=([uds.grid.face_dimension, dimn_maxfn], uds.ugrid.grid.face_edge_connectivity)),
+                          attrs={'cf_role': 'face_edge_connectivity', 'start_index': 0, '_FillValue': -1})
+
 data_fnc = uds.grid.to_dataset()[varn_fnc]
 
 if hasattr(data_fnc,'_FillValue'):
@@ -47,6 +58,31 @@ if hasattr(data_fnc,'start_index'):
     if data_fnc.attrs['start_index'] != 0:
         data_fnc = data_fnc - data_fnc.attrs['start_index'] #TODO: this drops attrs, re-add corrected attrs
 
+interpolation_tstart = dt.datetime.now()
+print(f'Starting interpolation from edges to faces of variable {varn_onedges}...')
+
+# > Determine face_edge_connectivity with nan-values where connectivity=-1 (_FillValue)
+face_coords = xr.DataArray(data=uds.grid.face_coordinates, dims=[uds.grid.face_dimension, 'Two'], coords=dict(mesh2d_face_x=(uds.grid.face_dimension, uds.ugrid.grid.face_coordinates[:,0]),mesh2d_face_y=(uds.grid.face_dimension, uds.grid.face_coordinates[:,1]))) # uds.grid.face_coordinates
+edge_coords = xr.DataArray(data=uds.grid.edge_coordinates, dims=[uds.grid.edge_dimension, 'Two'], coords=dict(mesh2d_edge_x=(uds.grid.edge_dimension, uds.ugrid.grid.edge_coordinates[:,0]), mesh2d_edge_y=(uds.grid.edge_dimension, uds.grid.edge_coordinates[:,1]))) # uds.grid.edge_coordinates
+face_edge_x_coords = xr.where(face_edges!=face_edges.attrs['_FillValue'], edge_coords[:,0][face_edges], np.nan)
+face_edge_y_coords = xr.where(face_edges!=face_edges.attrs['_FillValue'], edge_coords[:,1][face_edges], np.nan) # change xr --> np if working with numpy arrays
+
+# > Stack the edge coordinates the right way (with nan-values)
+face_edge_coords = xr.combine_nested([face_edge_x_coords, face_edge_y_coords], concat_dim='Two').transpose('mesh2d_nFaces',  'mesh2d_nMax_face_nodes', 'Two')
+
+# > Determine weights based on inverse distances  (direct)
+def xarray_distance_weights(a, b):
+    def weight_func(a, b):
+        distance = np.linalg.norm(a[:, np.newaxis, :] - b, axis=-1)
+        weights = distance / np.nansum(distance, axis=1)[:, np.newaxis] # remove this if you only want the distance
+        return weights
+    return xr.apply_ufunc(weight_func, a, b,
+    input_core_dims=[list(a.dims), list(b.dims)],
+    output_core_dims=[[a.dims[0], next(iter(set(b.dims) - set(a.dims)))]]
+    )
+
+weights_fe = xarray_distance_weights(face_coords, face_edge_coords)
+
 #TODO: interpolation is slow for many timesteps, so maybe use .sel() on time dimension first
 print('interpolation with indexer: step 1 (for each face, select all corresponding edge values)')
 edgevar_tofaces_onint_step1 = uds[varn_onedges].isel({dimn_edges:data_fnc}) #TODO: fails for cb_3d_map.nc, westernscheldt
@@ -55,7 +91,6 @@ edgevar_tofaces_onint_step2 = edgevar_tofaces_onint_step1.where(data_fnc_validbo
 print('interpolation with indexer: step 3 (average edge values per face)')
 edgevar_tofaces_onint = edgevar_tofaces_onint_step2.mean(dim=dimn_maxfn)
 print('interpolation with indexer: done')
-
 
 if hasattr(mesh2d_var,'interface_dimension'):
     print('average from interfaces to layers (so in z-direction) in case of a 3D model')
@@ -70,6 +105,9 @@ if hasattr(mesh2d_var,'interface_dimension'):
 else:
     edgevar_tofaces = edgevar_tofaces_onint
 
+
+# > Add to dataset
+uds[varn_onedges] = edgevar_tofaces
 
 #TODO: add inverse distance weighing, below example is from faces to edges, so make other way round
 """
