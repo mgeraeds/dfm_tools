@@ -414,8 +414,12 @@ def get_Dataset_atdepths(data_xr:xu.UgridDataset, depths, reference:str ='z0'):
         zw_reference = data_xr[varname_zint] - data_wl
     elif reference=='bedlevel':
         if varname_bl not in data_xr.variables:
-            raise KeyError(f'get_Dataset_atdepths() called with reference=bedlevel, but {varname_bl} variable not present') #TODO: in case of zsigma/sigma it can also be -mesh2d_bldepth
-        data_bl = data_xr[varname_bl]
+            try:
+                data_bl = data_xr.zcoordinate_w.min(dim='laydimw', skipna=True) # for history files
+            except:
+                raise KeyError(f'get_Dataset_atdepths() called with reference=bedlevel, but {varname_bl} variable not present') #TODO: in case of zsigma/sigma it can also be -mesh2d_bldepth
+        else:
+            data_bl = data_xr[varname_bl]
         zw_reference = data_xr[varname_zint] - data_bl
     else:
         raise KeyError(f'unknown reference "{reference}" (possible are z0, waterlevel and bedlevel') #TODO: make enum?
