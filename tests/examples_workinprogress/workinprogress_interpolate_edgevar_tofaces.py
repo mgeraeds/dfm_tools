@@ -8,6 +8,7 @@ Created on Thu Apr 13 14:04:56 2023
 import os
 import dfm_tools as dfmt
 import xarray as xr
+import numpy as np
 
 dir_testinput = r'c:\DATA\dfm_tools_testdata'
 
