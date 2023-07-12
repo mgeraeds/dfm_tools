@@ -21,6 +21,8 @@ dir_output = r'p:\11209231-003-bes-modellering\hydrodynamica\hackathon\preproces
 path_style = 'unix' # windows / unix
 overwrite = False # used for downloading of forcing data. Always set to True when changing the domain
 paths_relative = False #TODO: currently only works with path_style='windows' (same OS as IDE)
+is_geographic = True
+crs = 'EPSG:4326'
 
 inisaltem = True #initialsalinity/initialtemperature gives 33.8ppt uniform and sal instabilities right from the start of the model run. Proper way seems to be with iniwithnudge=2 and nudge_salinity_temperature, which gives ini sal/tem indeed but also instable. Providing nudge_salinity_temperature and iniwithnudge=0 gives more stable model but also inisal is 33.8 (not spatially varying) (is same as False maybe?)
 #TODO: salinity instable, also waterlevel and velocity magnitude are instable at northeast side of island (latter is with incorrect ordering/selection in extfile)
@@ -33,9 +35,9 @@ inisaltem = True #initialsalinity/initialtemperature gives 33.8ppt uniform and s
 #TODO: files that are not created in this script: obsfiles, dimr.xml and the submit script (and GEBCO+GSHHS datasets)
 #TODO: reference run in: p:\11209231-003-bes-modellering\hydrodynamica\hackathon\simulations\run001_mapInterval_1800\
 #TODO: also compare settings to p:\11208054-004-dcsm-fm\models\3D_DCSM-FM\2013-2017\B05_hydrolib_JV\DCSM-FM_0_5nm.mdu (e.g. tlfSmo)
-# domain
+# domain and resolution
 lon_min, lon_max, lat_min, lat_max = -68.55, -67.9, 11.8, 12.6
-bnd_dlon_dlat = 0.06
+dxy = 0.05
 
 #dates as understood by pandas.period_range(). ERA5 has freq='M' (month) and CMEMS has freq='D' (day)
 date_min = '2022-11-01'
@@ -47,37 +49,24 @@ ref_date = '2022-01-01'
 # option 2 (3D-model) = [airpressure, windx, windy, charnock, dewpoint, airtemperature, cloudiness, solarradiation, longwaveradiation, rainfall, evaporation]
 ERA5_meteo_option = 2
 
-## process
 # make dirs
 os.makedirs(dir_output, exist_ok=True)
 dir_output_data = os.path.join(dir_output, 'data')
 os.makedirs(dir_output_data, exist_ok=True)
 
-#%% initialize mdu file
-mdu_file = os.path.join(dir_output, f'{model_name}.mdu')
-mdu = hcdfm.FMModel()
 
-
-#%%bnd generation
-pli_polyfile = dfmt.generate_bndpli(lon_min, lon_max, lat_min, lat_max, dlon=bnd_dlon_dlat, dlat=bnd_dlon_dlat, name=f'{model_name}_bnd')
-#TODO: generate pli from mk with mk_object.mesh2d_get_mesh_boundaries_as_polygons()
-poly_file = os.path.join(dir_output, f'{model_name}.pli')
-pli_polyfile.save(poly_file)
-
-
-#%% grid generation
-# GEBCO bathymetry and Grid generation
+#%% grid generation and refinement with GEBCO bathymetry
 #select and plot bathy
 file_nc_bathy = r'p:\metocean-data\open\GEBCO\2021\GEBCO_2021.nc'
 data_bathy = xr.open_dataset(file_nc_bathy)
 data_bathy_sel = data_bathy.sel(lon=slice(lon_min-1,lon_max+1),lat=slice(lat_min-1,lat_max+1))
 
 #TODO: grid generation and bathy-refinement is still to be improved in meshkernel (https://github.com/Deltares/dfm_tools/issues/234)
-mk_object = dfmt.make_basegrid(lon_min, lon_max, lat_min, lat_max) #TODO: should be sperical, but is cartesian >> is_geographic keyword does not work yet
+mk_object = dfmt.make_basegrid(lon_min, lon_max, lat_min, lat_max, dx=dxy, dy=dxy, is_geographic=is_geographic)
 
 #refine
-min_face_size = 200/(40075*1000/360) #convert meters to degrees
-dfmt.refine_basegrid(mk=mk_object, data_bathy_sel=data_bathy_sel, min_face_size=min_face_size) #TODO: min_face_size is now in degrees instead of meters (maybe already works when is_geographic=True?)
+min_edge_size = 300 #in meters
+dfmt.refine_basegrid(mk=mk_object, data_bathy_sel=data_bathy_sel, min_edge_size=min_edge_size)
 
 #cutcells
 dfmt.meshkernel_delete_withcoastlines(mk=mk_object, res='h') #TODO: write used coastline to ldbfile?
@@ -85,13 +74,15 @@ dfmt.meshkernel_delete_withcoastlines(mk=mk_object, res='h') #TODO: write used c
 
 #TODO: cleanup grid necessary?
 # print('mk_object.mesh2d_get_obtuse_triangles_mass_centers()')
-# print(mk_object.mesh2d_get_obtuse_triangles_mass_centers())
+# print(mk_object.mesh2d_get_obtuse_triangles_mass_centers().values)
+# print('mk_object.mesh2d_get_orthogonality()')
+# print(mk_object.mesh2d_get_orthogonality().values.max()) #TODO: couple back to uds, currently ordering mismatch: https://github.com/Deltares/MeshKernelPy/issues/72
 # print('mk_object.mesh2d_get_hanging_edges()')
 # print(mk_object.mesh2d_get_hanging_edges())
 # mk_object.mesh2d_delete_hanging_edges()
 
 #convert to xugrid
-xu_grid_uds = dfmt.meshkernel_to_UgridDataset(mk=mk_object)
+xu_grid_uds = dfmt.meshkernel_to_UgridDataset(mk=mk_object, crs=crs)
 
 #interp bathy
 data_bathy_interp = data_bathy_sel.interp(lon=xu_grid_uds.obj.mesh2d_node_x, lat=xu_grid_uds.obj.mesh2d_node_y).reset_coords(['lat','lon']) #interpolates lon/lat gebcodata to mesh2d_nNodes dimension #TODO: if these come from xu_grid_uds (without ojb), the mesh2d_node_z var has no ugrid accessor since the dims are lat/lon instead of mesh2d_nNodes
@@ -99,70 +90,62 @@ xu_grid_uds['mesh2d_node_z'] = data_bathy_interp.elevation.clip(max=10)
 
 fig, ax = plt.subplots()
 xu_grid_uds.grid.plot(ax=ax,linewidth=1)
-ctx.add_basemap(ax=ax, crs='EPSG:4326', attribution=False)
-dfmt.plot_coastlines(ax=ax, crs='EPSG:4326')
+ctx.add_basemap(ax=ax, crs=crs, attribution=False)
+dfmt.plot_coastlines(ax=ax, crs=crs)
 
 fig, ax = plt.subplots()
 xu_grid_uds.mesh2d_node_z.ugrid.plot(ax=ax,center=False)
-ctx.add_basemap(ax=ax, crs='EPSG:4326', attribution=False)
-dfmt.plot_coastlines(ax=ax, crs='EPSG:4326')
+ctx.add_basemap(ax=ax, crs=crs, attribution=False)
+dfmt.plot_coastlines(ax=ax, crs=crs)
 
 #write xugrid grid to netcdf
 netfile  = os.path.join(dir_output, f'{model_name}_net.nc')
-xu_grid_uds.ugrid.to_netcdf(netfile)
-mdu.geometry.netfile = netfile #TODO: path is windows/unix dependent #TODO: providing os.path.basename(netfile) raises "ValidationError: 1 validation error for Geometry - netfile:   File: `C:\SnapVolumesTemp\MountPoints\{45c63495-0000-0000-0000-100000000000}\{79DE0690-9470-4166-B9EE-4548DC416BBD}\SVROOT\DATA\dfm_tools\tests\examples_workinprogress\Bonaire_net.nc` not found, skipped parsing." (wrong current directory)
+#xu_grid_uds.ugrid.to_netcdf(netfile) # TODO: this currently fails, below is a workaround: https://github.com/Deltares/xugrid/issues/119
+xu_grid_ds = dfmt.uds_to_1based_ds(xu_grid_uds)
+xu_grid_ds.to_netcdf(netfile)
 
 
-dir_output_data_cmems = os.path.join(dir_output_data, 'cmems')
-os.makedirs(dir_output_data_cmems, exist_ok=True)
+#%% generate plifile from grid extent 
+grid_bounds = xu_grid_uds.grid.bounds #TODO: maybe redefine lon_min etc instead. Also possible to get bounds from mk_object?
+pli_polyfile = dfmt.generate_bndpli(lon_min=grid_bounds[0], lon_max=grid_bounds[2], lat_min=grid_bounds[1], lat_max=grid_bounds[3], dlon=dxy, dlat=dxy, name=f'{model_name}_bnd')
+#TODO: generate pli from mk with mk_object.mesh2d_get_mesh_boundaries_as_polygons()
+poly_file = os.path.join(dir_output, f'{model_name}.pli')
+pli_polyfile.save(poly_file)
 
 
 #%% new ext: initial and open boundary condition
-
 ext_file_new = os.path.join(dir_output, f'{model_name}_new.ext')
 ext_new = hcdfm.ExtModel()
 
+# FES2014 tidal components bc file
+file_bc_basename = os.path.basename(poly_file).replace('.pli','')
+ForcingModel_object = dfmt.interpolate_tide_to_bc(tidemodel='FES2014', file_pli=poly_file, component_list=None) # tidemodel: FES2014, FES2012, EOT20, GTSM4.1preliminary
+file_bc_out = os.path.join(dir_output,f'tide_{file_bc_basename}_FES2014.bc')
+ForcingModel_object.save(filepath=file_bc_out)
+boundary_object = hcdfm.Boundary(quantity='waterlevelbnd', #the FM quantity for tide is also waterlevelbnd
+                                 locationfile=poly_file,
+                                 forcingfile=ForcingModel_object)
+ext_new.boundary.append(boundary_object)
+
 # CMEMS - download
+dir_output_data_cmems = os.path.join(dir_output_data, 'cmems')
+os.makedirs(dir_output_data_cmems, exist_ok=True)
 for varkey in ['so','thetao','uo','vo','zos']:
-    dfmt.download_CMEMS(credentials=None, #credentials=['username','password'], or create "%USERPROFILE%/CMEMS_credentials.txt" with username on line 1 and password on line 2. Register at: https://resources.marine.copernicus.eu/registration-form'
-                        varkey=varkey,
-                        longitude_min=lon_min-1/12, longitude_max=lon_max+1/12, latitude_min=lat_min-1/12, latitude_max=lat_max+1/12,
+    dfmt.download_CMEMS(varkey=varkey,
+                        longitude_min=lon_min, longitude_max=lon_max, latitude_min=lat_min, latitude_max=lat_max,
                         date_min=date_min, date_max=date_max,
                         dir_output=dir_output_data_cmems, file_prefix='cmems_', overwrite=overwrite)
 
-
 # CMEMS - boundary conditions file (.bc) (and add to ext_bnd)
-#TODO: two waterlevelbnds need to share same physical plifile in order to + (https://issuetracker.deltares.nl/browse/UNST-5320).
-list_quantities = ['salinitybnd','temperaturebnd','uxuyadvectionvelocitybnd','waterlevelbnd','tide'] #TODO: JV1 stable ("WARNING: Boundary link 00000468 already claimed")
-#list_quantities = ['waterlevelbnd','salinitybnd','temperaturebnd','uxuyadvectionvelocitybnd','tide'] #TODO: JV6 "ERROR  : update_ghostboundvals: not all ghost boundary flowlinks are being updated"
-ext_new = mb.preprocess_interpolate_nc_to_bc(ext_bnd=ext_new,
-                                             refdate_str = 'minutes since '+ref_date+' 00:00:00 +00:00',
-                                             dir_output = dir_output,
-                                             list_quantities = list_quantities,
-                                             tstart=pd.Timestamp(date_min)-pd.Timedelta(hours=12), tstop=pd.Timestamp(date_max)+pd.Timedelta(hours=12), #TODO: to account for noon-fields of CMEMS, build in safety?
-                                             list_plifiles = [poly_file],
-                                             dir_pattern = os.path.join(dir_output_data_cmems,'cmems_{ncvarname}_*.nc'))
-#TODO: when adding both waterlevelbnd and tide as waterlevelbnd they should be consequetive. If there are other quantities in between, the model crashes with a update_ghostboundvals error, reported in https://issuetracker.deltares.nl/browse/UNST-7011:
-"""
-** INFO   : partition_fixorientation_ghostlist: number of reversed flowlinks=              0
-** INFO   : Done partitioning model.
-** ERROR  : update_ghostboundvals: not all ghost boundary flowlinks are being updated
-** INFO   : Closed file : /p/11209231-003-bes-modellering/hydrodynamica/hackathon/preprocessing/ModelBuilderOutput_JV/Bonaire_old.ext
-** INFO   : partition_fixorientation_ghostlist: number of reversed flowlinks=              0
-** INFO   : Done partitioning model.
-** ERROR  : update_ghostboundvals: not all ghost boundary flowlinks are being updated
-** INFO   : Closed file : /p/11209231-003-bes-modellering/hydrodynamica/hackathon/preprocessing/ModelBuilderOutput_JV/Bonaire_old.ext
-Abort(1) on node 0 (rank 0 in comm 0): application called MPI_Abort(MPI_COMM_WORLD, 1) - process 0
-Abort(1) on node 1 (rank 1 in comm 0): application called MPI_Abort(MPI_COMM_WORLD, 1) - process 1
-"""
-#When doing a sequential run, the model initializes successfully, but first timestep cannot be solved.
-"""
-** WARNING: Comp. time step average below threshold:  0.5742E-03 <  0.1000E+00.
-** INFO   : Performing direct write of solution state...
-** INFO   : Simulation current time: nt = 100, time1 =  26265600.06s (2022-11-01T00:00:00Z).
-** INFO   : Done writing solution state.
-#### ERROR: dimr update ABORT,: myNameDFlowFM update failed, with return value 22 
-"""
+list_quantities = ['waterlevelbnd','salinitybnd','temperaturebnd','uxuyadvectionvelocitybnd'] # when supplying two waterlevelbnds to FM (tide and steric) with other quantities in between, dimrset>=2.24.00 is required or else "ERROR  : update_ghostboundvals: not all ghost boundary flowlinks are being updated" is raised (https://issuetracker.deltares.nl/browse/UNST-7011). Two waterlevelbnds need to share same physical plifile in order to be appended (https://issuetracker.deltares.nl/browse/UNST-5320).
+ext_new = mb.cmems_nc_to_bc(ext_bnd=ext_new,
+                            refdate_str=f'minutes since {ref_date} 00:00:00 +00:00',
+                            dir_output=dir_output,
+                            list_quantities=list_quantities,
+                            tstart=date_min,
+                            tstop=date_max, 
+                            file_pli=poly_file,
+                            dir_pattern=os.path.join(dir_output_data_cmems,'cmems_{ncvarname}_*.nc'))
 
 #save new ext file
 ext_new.save(filepath=ext_file_new,path_style=path_style)
@@ -184,7 +167,7 @@ if inisaltem:
 dir_output_data_era5 = os.path.join(dir_output_data,'ERA5')
 os.makedirs(dir_output_data_era5, exist_ok=True)
     
-if ERA5_meteo_option == 1: #TODO: pass option instead of varlist to fuctions?
+if ERA5_meteo_option == 1:
     varlist_list = [['msl','u10n','v10n','chnk']]
 elif ERA5_meteo_option == 2:
     varlist_list = [['msl','u10n','v10n','chnk'],['d2m','t2m','tcc'],['ssr','strd'],['mer','mtpr']]
@@ -192,22 +175,25 @@ elif ERA5_meteo_option == 2:
 for varlist in varlist_list:
     for varkey in varlist:
         dfmt.download_ERA5(varkey, 
-                            longitude_min=lon_min-1/4, longitude_max=lon_max+1/4, latitude_min=lat_min-1/4, latitude_max=lat_max+1/4, # download 1 grid cell row/column extra
-                            date_min=date_min, date_max=date_max,
-                            dir_output=dir_output_data_era5, overwrite=overwrite)
+                           longitude_min=lon_min, longitude_max=lon_max, latitude_min=lat_min, latitude_max=lat_max,
+                           date_min=date_min, date_max=date_max,
+                           dir_output=dir_output_data_era5, overwrite=overwrite)
 
 # ERA5 meteo - convert to netCDF for usage in Delft3D FM
-ext_old = mb.preprocess_merge_meteofiles(ext_old=ext_old,
-        mode = 'ERA5',
-        varkey_list = varlist_list,
-        dir_data = dir_output_data_era5,
-        dir_output = dir_output,
-        time_slice = slice(date_min, date_max))
+ext_old = mb.preprocess_merge_meteofiles_era5(ext_old=ext_old,
+                                              varkey_list = varlist_list,
+                                              dir_data = dir_output_data_era5,
+                                              dir_output = dir_output,
+                                              time_slice = slice(date_min, date_max))
 
 ext_old.save(filepath=ext_file_old,path_style=path_style)
 
 
-#%% .mdu settings
+#%% initialize mdu file and update settings
+mdu_file = os.path.join(dir_output, f'{model_name}.mdu')
+mdu = hcdfm.FMModel()
+
+mdu.geometry.netfile = netfile #TODO: path is windows/unix dependent #TODO: providing os.path.basename(netfile) raises "ValidationError: 1 validation error for Geometry - netfile:   File: `C:\SnapVolumesTemp\MountPoints\{45c63495-0000-0000-0000-100000000000}\{79DE0690-9470-4166-B9EE-4548DC416BBD}\SVROOT\DATA\dfm_tools\tests\examples_workinprogress\Bonaire_net.nc` not found, skipped parsing." (wrong current directory)
 mdu.geometry.bedlevuni = 5
 mdu.geometry.kmx = 20
 mdu.geometry.layertype = 1
@@ -267,15 +253,6 @@ mdu.output.statsinterval = [3600]
 
 #%% export model
 mdu.save(mdu_file,path_style=path_style)
-
-mdu_contents = open(str(mdu_file),'r').readlines()
-for iL, line in enumerate(mdu_contents):
-    if line.startswith('netFile'): #TODO: temporary workaround to use non-meshkernel grid (converted to spherical with interacter)
-        mdu_contents[iL] = 'netFile = bonaire_spherical_net.nc\n'
-    pass
-with open(mdu_file,'w') as f:
-    f.write(''.join(mdu_contents))
-
 
 #TODO: if windows/unix newextfile validation is fixed, use relative paths in .ext and in .mdu files (this is a workaround that only works for same-OS so windows paths)
 if paths_relative:

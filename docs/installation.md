@@ -2,16 +2,15 @@
 
 ## Basic installation
 
-- ``pip install dfm_tools`` (excludes ``cartopy`` since it is only installable via conda)
+- ``pip install dfm_tools``
 
 ## Recommended installation
 
-- download and install Anaconda 64 bit (with Python 3.8 or later) from [anaconda.com](https://www.anaconda.com/distribution/#download-section)
+- download and install Anaconda 64 bit (with Python 3.9 or later) from [anaconda.com](https://www.anaconda.com/distribution/#download-section)
 - open Anaconda prompt
-- ``conda create --name dfm_tools_env -c conda-forge python=3.8 spyder -y`` (you can also install a newer python version)
+- ``conda create --name dfm_tools_env python=3.9 git spyder -c conda-forge -y`` (``git`` and ``spyder`` are optional, you can also install a newer python version)
 - ``conda activate dfm_tools_env``
-- ``conda install -c conda-forge git shapely cartopy pyepsg geopandas contextily xarray dask netcdf4 bottleneck xugrid cdsapi pydap -y`` (installs conda-forge requirements)
-- install latest dfm_tools release: ``pip install dfm_tools``
+- install latest dfm_tools release: ``pip install dfm_tools -U`` (the ``-U`` is for updating)
 - alternatively install most recent dfm_tools version from github: ``python -m pip install git+https://github.com/Deltares/dfm_tools``
 - to remove environment when necessary: ``conda remove -n dfm_tools_env --all``
 

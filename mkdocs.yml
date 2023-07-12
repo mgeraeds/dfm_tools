@@ -62,10 +62,12 @@ nav:
   - Home: "README.md"
   - How-to:
       - Installation: "installation.md"
+      - Whats New: "whats-new.md"
       - Contributing: "CONTRIBUTING.md"
   - Tutorials:
       - Introduction: tutorials.md
       - notebooks/postprocessing_example.ipynb
       - notebooks/preprocessing_example_hydrolib.ipynb
+      - notebooks/modelbuilder_example.ipynb
   - API reference:
       - API reference: api_reference.md #TODO: automate generation of this file

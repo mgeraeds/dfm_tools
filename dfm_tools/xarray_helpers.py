@@ -9,7 +9,6 @@ import os
 import re
 from netCDF4 import Dataset
 import xarray as xr
-import xugrid as xu
 import datetime as dt
 import glob
 import pandas as pd
@@ -249,7 +248,7 @@ def merge_meteofiles(file_nc:str, preprocess=None,
     print(f'>> opening multifile dataset of {len(file_nc_list)} files (can take a while with lots of files): ',end='')
     dtstart = dt.datetime.now()
     data_xr = xr.open_mfdataset(file_nc_list,
-                                parallel=True, #speeds up the process
+                                #parallel=True, #TODO: speeds up the process, but often "OSError: [Errno -51] NetCDF: Unknown file format" on WCF
                                 preprocess=preprocess,
                                 chunks=chunks,
                                 drop_variables=drop_variables, #necessary since dims/vars with equal names are not allowed by xarray, add again later and requested matroos to adjust netcdf format.
@@ -265,21 +264,20 @@ def merge_meteofiles(file_nc:str, preprocess=None,
         else:
             raise KeyError('no longitude/latitude, lon/lat or x/y variables found in dataset')
 
-    varkeys = data_xr.variables.mapping.keys()
     #data_xr.attrs['comment'] = 'merged with dfm_tools from https://github.com/Deltares/dfm_tools' #TODO: add something like this or other attributes? (some might also be dropped now)
     
     #select time and do checks #TODO: check if calendar is standard/gregorian
-    data_xr_tsel = data_xr.sel(time=time_slice)
-    if data_xr_tsel.get_index('time').duplicated().any():
+    data_xr = data_xr.sel(time=time_slice)
+    if data_xr.get_index('time').duplicated().any():
         print('dropping duplicate timesteps')
-        data_xr_tsel = data_xr_tsel.sel(time=~data_xr_tsel.get_index('time').duplicated()) #drop duplicate timesteps
+        data_xr = data_xr.sel(time=~data_xr.get_index('time').duplicated()) #drop duplicate timesteps
     
     #check if there are times selected
-    if len(data_xr_tsel.time)==0:
+    if len(data_xr.time)==0:
         raise OutOfRangeError(f'ERROR: no times selected, ds_text={data_xr.time[[0,-1]].to_numpy()} and time_slice={time_slice}')
     
     #check if there are no gaps (more than one unique timestep)
-    times_pd = data_xr_tsel['time'].to_series()
+    times_pd = data_xr['time'].to_series()
     timesteps_uniq = times_pd.diff().iloc[1:].unique()
     if len(timesteps_uniq)>1:
         raise Exception(f'ERROR: gaps found in selected dataset (are there sourcefiles missing?), unique timesteps (hour): {timesteps_uniq/1e9/3600}')
@@ -290,79 +288,99 @@ def merge_meteofiles(file_nc:str, preprocess=None,
     if time_slice.stop not in times_pd.index:
         raise OutOfRangeError(f'ERROR: time_slice_stop="{time_slice.stop}" not in selected files, timerange: "{times_pd.index[0]}" to "{times_pd.index[-1]}"')
     
-    #TODO: check conversion implementation with hydro_tools\ERA5\ERA52DFM.py. Also move to separate function?
+    data_xr = convert_meteo_units(data_xr)
+    
+    #convert 0to360 sourcedata to -180to+180
+    convert_360to180 = (data_xr['longitude'].to_numpy()>180).any()
+    if convert_360to180: #TODO: make more flexible for models that eg pass -180/+180 crossing (add overlap at lon edges).
+        lon_newvar = (data_xr.coords['longitude'] + 180) % 360 - 180
+        data_xr.coords['longitude'] = lon_newvar.assign_attrs(data_xr['longitude'].attrs) #this re-adds original attrs
+        data_xr = data_xr.sortby(data_xr['longitude'])
+    
+    #GTSM specific addition for longitude overlap
+    if add_global_overlap: # assumes -180 to ~+179.75 (full global extent, but no overlap). Does not seem to mess up results for local models.
+        if len(data_xr.longitude.values) != len(np.unique(data_xr.longitude.values%360)):
+            raise Exception(f'add_global_overlap=True, but there are already overlapping longitude values: {data_xr.longitude}')
+        overlap_ltor = data_xr.sel(longitude=data_xr.longitude<=-179)
+        overlap_ltor['longitude'] = overlap_ltor['longitude'] + 360
+        overlap_rtol = data_xr.sel(longitude=data_xr.longitude>=179)
+        overlap_rtol['longitude'] = overlap_rtol['longitude'] - 360
+        data_xr = xr.concat([data_xr,overlap_ltor,overlap_rtol],dim='longitude').sortby('longitude')
+    
+    #GTSM specific addition for zerovalues during spinup
+    #TODO: doing this drops all encoding from variables, causing them to be converted into floats. Also makes sense since 0 pressure does not fit into int16 range as defined by scalefac and offset
+    #'scale_factor': 0.17408786412952254, 'add_offset': 99637.53795606793
+    #99637.53795606793 - 0.17408786412952254*32768
+    #99637.53795606793 + 0.17408786412952254*32767
+    if zerostart:
+        field_zerostart = data_xr.isel(time=[0,0])*0 #two times first field, set values to 0
+        field_zerostart['time'] = [times_pd.index[0]-dt.timedelta(days=2),times_pd.index[0]-dt.timedelta(days=1)] #TODO: is one zero field not enough? (is replacing first field not also ok? (results in 1hr transition period)
+        data_xr = xr.concat([field_zerostart,data_xr],dim='time',combine_attrs='no_conflicts') #combine_attrs argument prevents attrs from being dropped
+    
+    # converting from int16 to float32 (by removing dtype from encoding) or recompute scale_factor/add_offset is necessary for ERA5 dataset
+    #data_xr = prevent_dtype_int(data_xr)
+    data_xr = recompute_scaling_and_offset(data_xr)
+    
+    return data_xr
+
+
+def convert_meteo_units(data_xr):
+    
+    #TODO: check conversion implementation with hydro_tools\ERA5\ERA52DFM.py
+    #TODO: keep/update attrs
+    #TODO: reduce code complexity
+    
     def get_unit(data_xr_var):
         if 'units' in data_xr_var.attrs.keys():
             unit = data_xr_var.attrs["units"]
         else:
             unit = '-'
         return unit
+    
+    varkeys = data_xr.variables.mapping.keys()
+    
     #convert Kelvin to Celcius
     for varkey_sel in ['air_temperature','dew_point_temperature','d2m','t2m']: # 2 meter dewpoint temparature / 2 meter temperature
-        if varkey_sel in varkeys:
-            current_unit = get_unit(data_xr_tsel[varkey_sel])
-            new_unit = 'C'
-            print(f'converting {varkey_sel} unit from Kelvin to Celcius: [{current_unit}] to [{new_unit}]')
-            data_xr_tsel[varkey_sel].attrs['units'] = new_unit
-            data_xr_tsel[varkey_sel] = data_xr_tsel[varkey_sel] - 273.15
+        if varkey_sel not in varkeys:
+            continue
+        current_unit = get_unit(data_xr[varkey_sel])
+        new_unit = 'C'
+        print(f'converting {varkey_sel} unit from Kelvin to Celcius: [{current_unit}] to [{new_unit}]')
+        data_xr[varkey_sel] = data_xr[varkey_sel] - 273.15
+        data_xr[varkey_sel].attrs['units'] = new_unit
     #convert fraction to percentage
     for varkey_sel in ['cloud_area_fraction','tcc']: #total cloud cover
-        if varkey_sel in varkeys:
-            current_unit = get_unit(data_xr_tsel[varkey_sel])
-            new_unit = '%' #unit is soms al %
-            print(f'converting {varkey_sel} unit from fraction to percentage: [{current_unit}] to [{new_unit}]')
-            data_xr_tsel[varkey_sel].attrs['units'] = new_unit
-            data_xr_tsel[varkey_sel] = data_xr_tsel[varkey_sel] * 100
+        if varkey_sel not in varkeys:
+            continue
+        current_unit = get_unit(data_xr[varkey_sel])
+        new_unit = '%' #unit is soms al %
+        print(f'converting {varkey_sel} unit from fraction to percentage: [{current_unit}] to [{new_unit}]')
+        data_xr[varkey_sel] = data_xr[varkey_sel] * 100
+        data_xr[varkey_sel].attrs['units'] = new_unit
     #convert kg/m2/s to mm/day
     for varkey_sel in ['mer','mtpr']: #mean evaporation rate / mean total precipitation rate
-        if varkey_sel in varkeys:
-            current_unit = get_unit(data_xr_tsel[varkey_sel])
-            new_unit = 'mm/day'
-            print(f'converting {varkey_sel} unit from kg/m2/s to mm/day: [{current_unit}] to [{new_unit}]')
-            data_xr_tsel[varkey_sel].attrs['units'] = new_unit
-            data_xr_tsel[varkey_sel] = data_xr_tsel[varkey_sel] * 86400 # kg/m2/s to mm/day (assuming rho_water=1000)
+        if varkey_sel not in varkeys:
+            continue
+        current_unit = get_unit(data_xr[varkey_sel])
+        new_unit = 'mm/day'
+        print(f'converting {varkey_sel} unit from kg/m2/s to mm/day: [{current_unit}] to [{new_unit}]')
+        data_xr[varkey_sel] = data_xr[varkey_sel] * 86400 # kg/m2/s to mm/day (assuming rho_water=1000)
+        data_xr[varkey_sel].attrs['units'] = new_unit
     #convert J/m2 to W/m2
     for varkey_sel in ['ssr','strd']: #solar influx (surface_net_solar_radiation) / surface_thermal_radiation_downwards
-        if varkey_sel in varkeys:
-            current_unit = get_unit(data_xr_tsel[varkey_sel])
-            new_unit = 'W m**-2'
-            print(f'converting {varkey_sel} unit from J/m2 to W/m2: [{current_unit}] to [{new_unit}]')
-            data_xr_tsel[varkey_sel].attrs['units'] = new_unit
-            data_xr_tsel[varkey_sel] = data_xr_tsel[varkey_sel] / 3600 # 3600s/h #TODO: 1W = 1J/s, so does not make sense?
+        if varkey_sel not in varkeys:
+            continue
+        current_unit = get_unit(data_xr[varkey_sel])
+        new_unit = 'W m**-2'
+        print(f'converting {varkey_sel} unit from J/m2 to W/m2: [{current_unit}] to [{new_unit}]')
+        data_xr[varkey_sel] = data_xr[varkey_sel] / 3600 # 3600s/h #TODO: 1W = 1J/s, so does not make sense?
+        data_xr[varkey_sel].attrs['units'] = new_unit
     #solar influx increase for beta=6%
     if 'ssr' in varkeys:
         print('ssr (solar influx) increase for beta=6%')
-        data_xr_tsel['ssr'] = data_xr_tsel['ssr'] *.94
+        data_xr['ssr'] = data_xr['ssr'] *.94
     
-    #convert 0to360 sourcedata to -180to+180
-    convert_360to180 = (data_xr['longitude'].to_numpy()>180).any()
-    if convert_360to180:
-        data_xr.coords['longitude'] = (data_xr.coords['longitude'] + 180) % 360 - 180
-        data_xr = data_xr.sortby(data_xr['longitude'])
-    
-    #GTSM specific addition for longitude overlap
-    if add_global_overlap: # assumes -180 to ~+179.75 (full global extent, but no overlap). Does not seem to mess up results for local models.
-        if len(data_xr_tsel.longitude.values) != len(np.unique(data_xr_tsel.longitude.values%360)):
-            raise Exception(f'add_global_overlap=True, but there are already overlapping longitude values: {data_xr_tsel.longitude}')
-        overlap_ltor = data_xr_tsel.sel(longitude=data_xr_tsel.longitude<=-179)
-        overlap_ltor['longitude'] = overlap_ltor['longitude'] + 360
-        overlap_rtol = data_xr_tsel.sel(longitude=data_xr_tsel.longitude>=179)
-        overlap_rtol['longitude'] = overlap_rtol['longitude'] - 360
-        data_xr_tsel = xr.concat([data_xr_tsel,overlap_ltor,overlap_rtol],dim='longitude').sortby('longitude')
-    
-    #GTSM specific addition for zerovalues during spinup
-    if zerostart:
-        field_zerostart = data_xr_tsel.isel(time=[0,0])*0 #two times first field, set values to 0
-        field_zerostart['time'] = [times_pd.index[0]-dt.timedelta(days=2),times_pd.index[0]-dt.timedelta(days=1)] #TODO: is one zero field not enough? (is replacing first field not also ok? (results in 1hr transition period)
-        data_xr_tsel = xr.concat([field_zerostart,data_xr_tsel],dim='time')#.sortby('time')
-    
-    # converting from int16 to float32 (by removing dtype from encoding) or recompute scale_factor/add_offset is necessary for ERA5 dataset
-    #data_xr_tsel = prevent_dtype_int(data_xr_tsel)
-    data_xr_tsel = recompute_scaling_and_offset(data_xr_tsel)
-    
-    #data_xr_tsel.time.encoding['units'] = 'hours since 1900-01-01 00:00:00' #TODO: maybe add different reftime?
-    
-    return data_xr_tsel
+    return data_xr
 
 
 def Dataset_varswithdim(ds,dimname): #TODO: dit zit ook in xugrid, wordt nu gebruikt in hisfile voorbeeldscript en kan handig zijn, maar misschien die uit xugrid gebruiken?
@@ -380,158 +398,4 @@ def Dataset_varswithdim(ds,dimname): #TODO: dit zit ook in xugrid, wordt nu gebr
     
     return ds
 
-
-def get_vertical_dimensions(uds): #TODO: maybe add layer_dimension and interface_dimension properties to xugrid?
-    """
-    get vertical_dimensions from grid_info of ugrid mapfile (this will fail for hisfiles). The info is stored in the layer_dimension and interface_dimension attribute of the mesh2d variable of the dataset (stored in uds.grid after reading with xugrid)
-    
-    processing cb_3d_map.nc
-        >> found layer/interface dimensions in file: mesh2d_nLayers mesh2d_nInterfaces
-    processing Grevelingen-FM_0*_map.nc
-        >> found layer/interface dimensions in file: nmesh2d_layer nmesh2d_interface (these are updated in open_partitioned_dataset)
-    processing DCSM-FM_0_5nm_0*_map.nc
-        >> found layer/interface dimensions in file: mesh2d_nLayers mesh2d_nInterfaces
-    processing MB_02_0*_map.nc
-        >> found layer/interface dimensions in file: mesh2d_nLayers mesh2d_nInterfaces
-    """
-    
-    if not hasattr(uds,'grid'): #early return in case of e.g. hisfile
-        return None, None
-        
-    gridname = uds.grid.name
-    grid_info = uds.grid.to_dataset()[gridname]
-    if hasattr(grid_info,'layer_dimension'):
-        return grid_info.layer_dimension, grid_info.interface_dimension
-    else:
-        return None, None
-
-
-def remove_ghostcells(uds): #TODO: create JIRA issue: add domainno attribute to partitioned mapfiles or remove ghostcells from output (or make values in ghostcells the same as not-ghostcells)
-    """
-    Dropping ghostcells if there is a domainno variable present and there is a domainno in the filename.
-    Not using most-occurring domainno in var, since this is not a valid assumption for merged datasets and might be invalid for a very small partition.
-    
-    """
-    gridname = uds.grid.name
-    varn_domain = f'{gridname}_flowelem_domain'
-    
-    #check if dataset has domainno variable, return uds if not present
-    if varn_domain not in uds.data_vars:
-        print('[nodomainvar] ',end='')
-        return uds
-    
-    #derive domainno from filename, return uds if not present
-    fname = uds.encoding['source']
-    if '_' not in fname: #safety escape in case there is no _ in the filename
-        print('[nodomainfname] ',end='')
-        return uds
-    fname_splitted = fname.split('_')
-    part_domainno_fromfname = fname_splitted[-2] #this is not valid for rstfiles (date follows after partnumber), but they cannot be read with xugrid anyway since they are mapformat=1
-    if not part_domainno_fromfname.isnumeric() or len(part_domainno_fromfname)!=4:
-        print('[nodomainfname] ',end='')
-        return uds
-    
-    #drop ghostcells
-    part_domainno_fromfname = int(part_domainno_fromfname)
-    da_domainno = uds[varn_domain]
-    idx = np.flatnonzero(da_domainno == part_domainno_fromfname)
-    uds = uds.isel({uds.grid.face_dimension:idx})
-    return uds
-
-
-def remove_periodic_cells(uds): #TODO: implement proper fix: https://github.com/Deltares/xugrid/issues/63
-    """
-    For global models with grids that go "around the back". Temporary fix to drop all faces that are larger than grid_extent/2 (eg 360/2=180 degrees in case of GTSM)
-    
-    """
-    #print('>> remove_periodic_cells() on dataset: ',end='')
-    #dtstart = dt.datetime.now()
-    face_node_x = uds.grid.face_node_coordinates[:,:,0]
-    grid_extent = uds.grid.bounds[2] - uds.grid.bounds[0]
-    face_node_maxdx = np.nanmax(face_node_x,axis=1) - np.nanmin(face_node_x,axis=1)
-    bool_face = face_node_maxdx < grid_extent/2
-    if bool_face.all(): #early return for when no cells have to be removed (might increase performance)
-        return uds
-    uds = uds.sel({uds.grid.face_dimension:bool_face})
-    #print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
-    return uds
-
-
-def open_partitioned_dataset(file_nc, chunks={'time':1}, remove_ghost=True, remove_periodic=False, **kwargs): 
-    """
-    using xugrid to read and merge partitions, with some additional features (remaning old layerdim, timings, set zcc/zw as data_vars)
-
-    Parameters
-    ----------
-    file_nc : TYPE
-        DESCRIPTION.
-    chunks : TYPE, optional
-        chunks={'time':1} increases performance significantly upon reading, but causes memory overloads when performing sum/mean/etc actions over time dimension (in that case 100/200 is better). The default is {'time':1}.
-
-    Raises
-    ------
-    Exception
-        DESCRIPTION.
-
-    Returns
-    -------
-    ds_merged_xu : TYPE
-        DESCRIPTION.
-    
-    file_nc = 'p:\\1204257-dcsmzuno\\2006-2012\\3D-DCSM-FM\\A18b_ntsu1\\DFM_OUTPUT_DCSM-FM_0_5nm\\DCSM-FM_0_5nm_0*_map.nc' #3D DCSM
-    file_nc = 'p:\\archivedprojects\\11206813-006-kpp2021_rmm-2d\\C_Work\\31_RMM_FMmodel\\computations\\model_setup\\run_207\\results\\RMM_dflowfm_0*_map.nc' #RMM 2D
-    file_nc = 'p:\\1230882-emodnet_hrsm\\GTSMv5.0\\runs\\reference_GTSMv4.1_wiCA_2.20.06_mapformat4\\output\\gtsm_model_0*_map.nc' #GTSM 2D
-    file_nc = 'p:\\11208053-005-kpp2022-rmm3d\\C_Work\\01_saltiMarlein\\RMM_2019_computations_02\\computations\\theo_03\\DFM_OUTPUT_RMM_dflowfm_2019\\RMM_dflowfm_2019_0*_map.nc' #RMM 3D
-    file_nc = 'p:\\archivedprojects\\11203379-005-mwra-updated-bem\\03_model\\02_final\\A72_ntsu0_kzlb2\\DFM_OUTPUT_MB_02\\MB_02_0*_map.nc'
-    Timings (xu.open_dataset/xu.merge_partitions):
-        - DCSM 3D 20 partitions  367 timesteps: 231.5/ 4.5 sec (decode_times=False: 229.0 sec)
-        - RMM  2D  8 partitions  421 timesteps:  55.4/ 4.4 sec (decode_times=False:  56.6 sec)
-        - GTSM 2D  8 partitions  746 timesteps:  71.8/30.0 sec (decode_times=False: 204.8 sec)
-        - RMM  3D 40 partitions  146 timesteps: 168.8/ 6.3 sec (decode_times=False: 158.4 sec)
-        - MWRA 3D 20 partitions 2551 timesteps:  74.4/ 3.4 sec (decode_times=False:  79.0 sec)
-    
-    """
-    #TODO: FM-mapfiles contain wgs84/projected_coordinate_system variables. xugrid has .crs property, projected_coordinate_system/wgs84 should be updated to be crs so it will be automatically handled? >> make dflowfm issue (and https://github.com/Deltares/xugrid/issues/42)
-    #TODO: add support for multiple grids via keyword? GTSM+riv grid also only contains only one grid, so no testcase available
-    #TODO: speed up open_dataset https://github.com/Deltares/dfm_tools/issues/225 (also remove_ghost and remove_periodic)
-    
-    dtstart_all = dt.datetime.now()
-    file_nc_list = file_to_list(file_nc)
-    
-    print(f'>> xu.open_dataset() with {len(file_nc_list)} partition(s): ',end='')
-    dtstart = dt.datetime.now()
-    partitions = []
-    for iF, file_nc_one in enumerate(file_nc_list):
-        print(iF+1,end=' ')
-        ds = xr.open_dataset(file_nc_one, chunks=chunks, **kwargs)
-        if 'nFlowElem' in ds.dims and 'nNetElem' in ds.dims: #for mapformat1 mapfiles: merge different face dimensions (rename nFlowElem to nNetElem) to make sure the dataset topology is correct
-            print('[mapformat1] ',end='')
-            ds = ds.rename({'nFlowElem':'nNetElem'})
-        uds = xu.core.wrap.UgridDataset(ds)
-        if remove_ghost: #TODO: this makes it way slower (at least for GTSM), but is necessary since values on overlapping cells are not always identical (eg in case of Venice ucmag)
-            uds = remove_ghostcells(uds)
-        if remove_periodic: #TODO: makes it also slower, check if bool/idx makes difference in performance?
-            uds = remove_periodic_cells(uds)
-        partitions.append(uds)
-    print(': ',end='')
-    print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
-    
-    if len(partitions) == 1: #do not merge in case of 1 partition
-        return partitions[0]
-    
-    print(f'>> xu.merge_partitions() with {len(file_nc_list)} partition(s): ',end='')
-    dtstart = dt.datetime.now()
-    ds_merged_xu = xu.merge_partitions(partitions)
-    print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
-    
-    #print variables that are dropped in merging procedure. Often only ['mesh2d_face_x_bnd', 'mesh2d_face_y_bnd'], which can be derived by combining node_coordinates (mesh2d_node_x mesh2d_node_y) and face_node_connectivity (mesh2d_face_nodes). >> can be removed from FM-mapfiles (email of 16-1-2023)
-    varlist_onepart = list(partitions[0].variables.keys())
-    varlist_merged = list(ds_merged_xu.variables.keys())
-    varlist_dropped_bool = ~pd.Series(varlist_onepart).isin(varlist_merged)
-    varlist_dropped = pd.Series(varlist_onepart).loc[varlist_dropped_bool]
-    if varlist_dropped_bool.any():
-        print(f'>> some variables dropped with merging of partitions: {varlist_dropped.tolist()}')
-    
-    print(f'>> dfmt.open_partitioned_dataset() total: {(dt.datetime.now()-dtstart_all).total_seconds():.2f} sec')
-    return ds_merged_xu
 

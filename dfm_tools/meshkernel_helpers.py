@@ -16,22 +16,58 @@ from dfm_tools import __version__
 import getpass
 import numpy as np
 from dfm_tools.coastlines import get_coastlines_gdb
+from netCDF4 import default_fillvals
+import geopandas as gpd
 
 
-def meshkernel_delete_withcoastlines(mk, res:str='f', min_area:float = 0, crs=None):
+def meshkernel_delete_withcoastlines(mk:meshkernel.meshkernel.MeshKernel, res:str='f', min_area:float = 0, crs:(int,str) = None):
     """
-    empty docstring
+    Wrapper around meshkernel_delete_withgdf, which automatically gets the bbox from the meshkernel object and retrieves the coastlines_gdf.
+
+    Parameters
+    ----------
+    mk : meshkernel.meshkernel.MeshKernel
+        DESCRIPTION.
+    res : str, optional
+        DESCRIPTION. The default is 'f'.
+    min_area : float, optional
+        DESCRIPTION. The default is 0.
+    crs : (int,str), optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    None.
+
     """
+    
     mesh_bnds = mk.mesh2d_get_mesh_boundaries_as_polygons()
     mesh_bnds.x_coordinates
     bbox = (mesh_bnds.x_coordinates.min(), mesh_bnds.y_coordinates.min(), mesh_bnds.x_coordinates.max(), mesh_bnds.y_coordinates.max())
     
-    print('>> reading coastlines: ',end='')
-    dtstart = dt.datetime.now()
-    coastlines_gdb = get_coastlines_gdb(bbox=bbox, res=res, min_area=min_area, crs=crs)
-    print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
+    coastlines_gdf = get_coastlines_gdb(bbox=bbox, res=res, min_area=min_area, crs=crs)
     
-    for coastline_geom in coastlines_gdb['geometry']: #TODO: also possible without loop? >> geometry_separator=-999.9 so that value can be used to concat polygons. >> use hydrolib poly as input? https://github.com/Deltares/MeshKernelPy/issues/35
+    meshkernel_delete_withgdf(mk, coastlines_gdf)
+
+
+def meshkernel_delete_withgdf(mk:meshkernel.meshkernel.MeshKernel, coastlines_gdf:gpd.GeoDataFrame):
+    """
+    Delete parts of mesh that are inside the polygons/Linestrings in a GeoDataFrame.
+
+    Parameters
+    ----------
+    mk : meshkernel.meshkernel.MeshKernel
+        DESCRIPTION.
+    coastlines_gdf : gpd.GeoDataFrame
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    
+    for coastline_geom in coastlines_gdf['geometry']:
         xx, yy = coastline_geom.exterior.coords.xy
         xx = np.array(xx)
         yy = np.array(yy)
@@ -39,40 +75,58 @@ def meshkernel_delete_withcoastlines(mk, res:str='f', min_area:float = 0, crs=No
         delete_pol_geom = meshkernel.GeometryList(x_coordinates=xx, y_coordinates=yy) #TODO: .copy()/to_numpy() makes the array contiguous in memory, which is necessary for meshkernel.mesh2d_delete()
         mk.mesh2d_delete(geometry_list=delete_pol_geom, 
                          delete_option=meshkernel.DeleteMeshOption(2), #ALL_COMPLETE_FACES/2: Delete all faces of which the complete face is inside the polygon
-                         invert_deletion=False) #TODO: cuts away link that is neccesary, so results in non-orthogonal grid (probably usecase of english channel?)
+                         invert_deletion=False)
 
 
-def meshkernel_delete_withpol(mk, file_ldb, minpoints=None):
+def meshkernel_check_geographic(mk:meshkernel.meshkernel.MeshKernel) -> bool:
     """
-    empty docstring
+    Get projection from meshkernel instance
+
+    Parameters
+    ----------
+    mk : meshkernel.meshkernel.MeshKernel
+        DESCRIPTION.
+
+    Returns
+    -------
+    bool
+        DESCRIPTION.
+
     """
-    #TODO: read file_ldb as geodataframe (convert pointlike to geodataframe) and merge code with meshkernel_delete_withcoastlines
     
-    print('>> reading+converting ldb: ',end='')
-    dtstart = dt.datetime.now()
-    pol_ldb = hcdfm.PolyFile(file_ldb)
-    pol_ldb_list = [pointlike_to_DataFrame(x) for x in pol_ldb.objects] #TODO: this is quite slow, speed up possible?
-    if minpoints is not None:
-        pol_ldb_list = [x for x in pol_ldb_list if len(x)>minpoints] #filter only large polygons for performance
-    for iP, pol_ldb in enumerate(pol_ldb_list):
-        if not (pol_ldb.iloc[0] == pol_ldb.iloc[-1]).all(): #close the polygon if it is not yet closed
-            pol_ldb_list[iP] = pd.concat([pol_ldb,pol_ldb.iloc[[0]]],axis=0)
-    print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
+    if mk.get_projection()==meshkernel.ProjectionType.SPHERICAL:
+        is_geographic = True
+    else:
+        is_geographic = False
+    return is_geographic
+
+
+def meshkernel_to_UgridDataset(mk:meshkernel.MeshKernel, crs:(int,str) = None, remove_noncontiguous:bool = False) -> xu.UgridDataset:
+    """
+    Convert a meshkernel object to a UgridDataset, including a variable with the crs (used by dflowfm to distinguish spherical/cartesian networks).
+    The UgridDataset enables bathymetry interpolation and writing to netfile.
+
+    Parameters
+    ----------
+    mk : meshkernel.MeshKernel
+        DESCRIPTION.
+    crs : (int,str), optional
+        DESCRIPTION. The default is None.
+    remove_noncontiguous : bool, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
     
-    for iP, pol_del in enumerate(pol_ldb_list): #TODO: also possible without loop? >> geometry_separator=-999.9 so that value can be used to concat polygons. >> use hydrolib poly as input? https://github.com/Deltares/MeshKernelPy/issues/35
-        delete_pol_geom = meshkernel.GeometryList(x_coordinates=pol_del['x'].to_numpy(), y_coordinates=pol_del['y'].to_numpy()) #TODO: .copy()/to_numpy() makes the array contiguous in memory, which is necessary for meshkernel.mesh2d_delete()
-        mk.mesh2d_delete(geometry_list=delete_pol_geom, 
-                         delete_option=meshkernel.DeleteMeshOption(2), #ALL_COMPLETE_FACES/2: Delete all faces of which the complete face is inside the polygon
-                         invert_deletion=False) #TODO: cuts away link that is neccesary, so results in non-orthogonal grid (probably usecase of english channel?)
-
-
-def meshkernel_to_UgridDataset(mk:meshkernel.meshkernel.MeshKernel, remove_noncontiguous:bool = False) -> xr.Dataset:
-    """
-    empty docstring
-    """
-    mesh2d_grid3 = mk.mesh2d_get()
-
-    xu_grid = xu.Ugrid2d.from_meshkernel(mesh2d_grid3)
+    is_geographic = meshkernel_check_geographic(mk)
+    
+    mesh2d_grid = mk.mesh2d_get()
+    
+    xu_grid = xu.Ugrid2d.from_meshkernel(mesh2d_grid)
     
     #remove non-contiguous grid parts
     def xugrid_remove_noncontiguous(grid):
@@ -95,88 +149,139 @@ def meshkernel_to_UgridDataset(mk:meshkernel.meshkernel.MeshKernel, remove_nonco
     xu_grid_ds = xu_grid.to_dataset()
     
     #convert 0-based to 1-based grid for connectivity variables like face_node_connectivity #TODO: FM kernel needs 1-based grid, but it should read the attributes instead. Report this (#ug_get_meshgeom, #12, ierr=0. ** WARNING: Could not read mesh face x-coordinates)
-    ds_idx = xu_grid_ds.filter_by_attrs(start_index=0)
-    for varn_conn in ds_idx.data_vars:
-        xu_grid_ds[varn_conn] += 1
-        xu_grid_ds[varn_conn].attrs["_FillValue"] += 1
-        xu_grid_ds[varn_conn].attrs["start_index"] += 1
+    # TODO: this now results in corrupt grid, workaround is using uds_to_1based_ds after bathy interpolation
+    # ds_idx = xu_grid_ds.filter_by_attrs(start_index=0)
+    # for varn_conn in ds_idx.data_vars:
+    #     xu_grid_ds[varn_conn] += 1
+    #     xu_grid_ds[varn_conn].attrs["_FillValue"] += 1
+    #     xu_grid_ds[varn_conn].attrs["start_index"] += 1
     
-    xu_grid_ds = xu_grid_ds.assign_attrs({#'Conventions': 'CF-1.8 UGRID-1.0 Deltares-0.10', #add Deltares convention (was CF-1.8 UGRID-1.0)
+    xu_grid_ds = xu_grid_ds.assign_attrs({#'Conventions': 'CF-1.8 UGRID-1.0 Deltares-0.10', #TODO: conventions come from xugrid, so this line is probably not necessary
                                           'institution': 'Deltares',
                                           'references': 'https://www.deltares.nl',
                                           'source': f'Created with meshkernel {meshkernel.__version__}, xugrid {xu.__version__} and dfm_tools {__version__}',
                                           'history': 'Created on %s, %s'%(dt.datetime.now().strftime('%Y-%m-%dT%H:%M:%S%z'),getpass.getuser()), #TODO: add timezone
                                           })
-    
-    # add attrs (to projected_coordinate_system/wgs84 empty int variable): #TODO: should depend on is_geographic flag in make_basegrid()
-    # attribute_dict = {
-    #     'name': 'WGS84',
-    #     'epsg': np.array([4326], dtype=int),
-    #     'grid_mapping_name': 'Unknown projected',
-    #     'longitude_of_prime_meridian': np.array([0.0], dtype=float),
-    #     'semi_major_axis': np.array([6378137.0], dtype=float),
-    #     'semi_minor_axis': np.array([6356752.314245], dtype=float),
-    #     'inverse_flattening': np.array([6356752.314245], dtype=float),
-    #     'EPSG_code': 'EPSG:4326',
-    #     'value': 'value is equal to EPSG code'}
-    # xu_grid_ds['wgs84'] = xr.DataArray(np.array(0,dtype=int),dims=(),attrs=attribute_dict)
+    #TODO: xugrid overwrites these global attributes upon saving the network file: https://github.com/Deltares/xugrid/issues/111
     
     xu_grid_uds = xu.UgridDataset(xu_grid_ds)
+    add_crs_to_dataset(uds=xu_grid_uds,is_geographic=is_geographic,crs=crs)
+    
     return xu_grid_uds
 
 
-def make_basegrid(lon_min,lon_max,lat_min,lat_max,dx=0.05,dy=0.05,angle=0):
+def uds_to_1based_ds(uds):
+    ds = uds.ugrid.to_dataset()
+    ds_idx = ds.filter_by_attrs(start_index=0)
+    for varn_conn in ds_idx.data_vars:
+        ds[varn_conn] += 1
+        ds[varn_conn].attrs["_FillValue"] += 1
+        ds[varn_conn].attrs["start_index"] += 1
+    
+    # print('_FillValue:', ds.mesh2d_face_nodes.attrs['_FillValue'])
+    # print('start_index:', ds.mesh2d_face_nodes.attrs['start_index'])
+    # print('min:', ds.mesh2d_face_nodes.to_numpy().min())
+    # print('max:', ds.mesh2d_face_nodes.to_numpy().max())
+    return ds
+
+
+def add_crs_to_dataset(uds:(xu.UgridDataset,xr.Dataset),is_geographic:bool,crs:(str,int)):
+    """
+    
+
+    Parameters
+    ----------
+    uds : (xu.UgridDataset,xr.Dataset)
+        DESCRIPTION.
+    is_geographic : bool
+        whether it is a spherical (True) or cartesian (False), property comes from meshkernel instance.
+    crs : (str,int)
+        epsg, e.g. 'EPSG:4326' or 4326.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    #get crs information (name/num)
+    if crs is None:
+        crs_num = 0
+        crs_name = ''
+    else:
+        crs_info = gpd.GeoSeries(crs=crs).crs #also contains area-of-use (name/bounds), datum (ellipsoid/prime-meridian)
+        crs_num = crs_info.to_epsg()
+        crs_name = crs_info.name
+    crs_str = f'EPSG:{crs_num}'
+    
+    #check if combination of is_geographic and crs makes sense
+    if is_geographic and crs_num!=4326:
+        raise ValueError(f'provided grid is sperical (is_geographic=True) but crs="{crs}" while only "EPSG:4326" (WGS84) is supported for spherical grids') #TODO: is this true?
+    if not is_geographic and crs_num==4326:
+        raise ValueError('provided grid is cartesian (is_geographic=False) but crs="EPSG:4326" (WGS84), this combination is not supported')
+    
+    if is_geographic:
+        grid_mapping_name = 'latitude_longitude'
+        crs_varn = 'wgs84'
+    else:
+        grid_mapping_name = 'Unknown projected'
+        crs_varn = 'projected_coordinate_system'
+    
+    attribute_dict = {
+        'name': crs_name, # not required, but convenient for the user
+        'epsg': np.array(crs_num, dtype=int), # epsg or EPSG_code should be present for the interacter to load the grid and by QGIS to recognize the epsg.
+        'EPSG_code': crs_str, # epsg or EPSG_code should be present for the interacter to load the grid and by QGIS to recognize the epsg.
+        'grid_mapping_name': grid_mapping_name, # without grid_mapping_name='latitude_longitude', interacter sees the grid as cartesian
+        }
+    
+    uds[crs_varn] = xr.DataArray(np.array(default_fillvals['i4'],dtype=int),dims=(),attrs=attribute_dict)
+
+
+def make_basegrid(lon_min,lon_max,lat_min,lat_max,dx,dy,angle=0,is_geographic=True):
     """
     empty docstring
     """
-    print('modelbuilder.make_basegrid()')
     # create base grid
-    num_columns = int(np.round((lon_max-lon_min)/dx))
-    num_rows = int(np.round((lat_max-lat_min)/dy))
-    
-    make_grid_parameters = meshkernel.MakeGridParameters(num_columns=num_columns,
-                                                         num_rows=num_rows,
-                                                         angle=angle,
+    make_grid_parameters = meshkernel.MakeGridParameters(angle=angle,
                                                          origin_x=lon_min,
                                                          origin_y=lat_min,
+                                                         upper_right_x=lon_max,
+                                                         upper_right_y=lat_max,
                                                          block_size_x=dx,
                                                          block_size_y=dy)
     
-    geometry_list = meshkernel.GeometryList(np.empty(0, dtype=np.double), np.empty(0, dtype=np.double)) # A polygon must to be provided. If empty it will not be used. If a polygon is provided it will be used in the generation of the curvilinear grid. The polygon must be closed
-    mk = meshkernel.MeshKernel() #TODO: is_geographic=True was used in modelbuilder, but refinement super slow and raises "MeshKernelError: MeshRefinement::connect_hanging_nodes: The number of non-hanging nodes is neither 3 nor 4."
-    mk.curvilinear_make_uniform(make_grid_parameters, geometry_list) #TODO: make geometry_list argument optional: https://github.com/Deltares/MeshKernelPy/issues/30
+    mk = meshkernel.MeshKernel(is_geographic=is_geographic)
+    mk.curvilinear_make_uniform_on_extension(make_grid_parameters)
     mk.curvilinear_convert_to_mesh2d() #convert to ugrid/mesh2d
     
     return mk
 
 
-def refine_basegrid(mk, data_bathy_sel,min_face_size=0.1):
+def refine_basegrid(mk, data_bathy_sel, min_edge_size):
     """
     empty docstring
     """
-    print('modelbuilder.refine_basegrid()')
-    samp_x,samp_y = np.meshgrid(data_bathy_sel.lon.to_numpy(),data_bathy_sel.lat.to_numpy())
-    samp_z = data_bathy_sel.elevation.to_numpy().astype(float) #TODO: without .astype(float), meshkernelpy generates "TypeError: incompatible types, c_short_Array_27120 instance instead of LP_c_double instance": https://github.com/Deltares/MeshKernelPy/issues/31
-    samp_x = samp_x.ravel()
-    samp_y = samp_y.ravel()
-    samp_z = samp_z.ravel()
-    geomlist = meshkernel.GeometryList(x_coordinates=samp_x, y_coordinates=samp_y, values=samp_z) #TODO: does not check if lenghts of input array is equal (samp_z[1:]) https://github.com/Deltares/MeshKernelPy/issues/32
     
+    lon_np = data_bathy_sel.lon.to_numpy()
+    lat_np = data_bathy_sel.lat.to_numpy()
+    values_np = data_bathy_sel.elevation.to_numpy().flatten().astype('float') #TODO: astype to avoid "TypeError: incompatible types, c_short_Array_74880 instance instead of LP_c_double instance"
+    gridded_samples = meshkernel.GriddedSamples(x_coordinates=lon_np,y_coordinates=lat_np,values=values_np)
+
+
     #refinement
-    mesh_refinement_parameters = meshkernel.MeshRefinementParameters(refine_intersected=False, #TODO: provide defaults for several arguments, so less arguments are required
-                                                                     use_mass_center_when_refining=False, #TODO: what does this do?
-                                                                     min_face_size=min_face_size, #TODO: size in meters would be more convenient: https://github.com/Deltares/MeshKernelPy/issues/33
+    mesh_refinement_parameters = meshkernel.MeshRefinementParameters(min_edge_size=min_edge_size, #always in meters
                                                                      refinement_type=meshkernel.RefinementType(1), #Wavecourant/1,
                                                                      connect_hanging_nodes=True, #set to False to do multiple refinement steps (e.g. for multiple regions)
-                                                                     account_for_samples_outside_face=True, #outsidecell argument for --refine?
-                                                                     max_refinement_iterations=5,
-                                                                     ) #TODO: missing the arguments dtmax (necessary?), hmin (min_face_size but then in meters instead of degrees), smoothiters (currently refinement is patchy along coastlines, goes good in dflowfm exec after additional implementation of HK), spherical 1/0 (necessary?)
+                                                                     smoothing_iterations=2,
+                                                                     max_courant_time=120)
     
-    mk.mesh2d_refine_based_on_samples(samples=geomlist,
-                                       relative_search_radius=0.5, #TODO: bilin interp is preferred, but this is currently not supported (samples have to be ravelled): https://github.com/Deltares/MeshKernelPy/issues/34
-                                       minimum_num_samples=3,
-                                       mesh_refinement_params=mesh_refinement_parameters,
-                                       )
+    mk.mesh2d_refine_based_on_gridded_samples(gridded_samples=gridded_samples,
+                                               mesh_refinement_params=mesh_refinement_parameters,
+                                               use_nodal_refinement=True) #TODO: what does this do?
     
     return mk
 

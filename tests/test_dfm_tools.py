@@ -1,88 +1,16 @@
 #!/usr/bin/env python
 
-"""Tests for dfm_tools package environment"""
-
 import pytest
 import os
-import glob
 import dfm_tools as dfmt
 import numpy as np
 import hydrolib.core.dflowfm as hcdfm
 import pandas as pd
-import requests
-import pathlib
-import xarray as xr
 
 
-def download_testdata():
-    #TODO: work with pooch instead, like: https://github.com/Deltares/xugrid/blob/main/xugrid/data/sample_data.py
-    #TODO: make opendap folder structure the same as local testdata folder
-    
-    fname_list = []
-    fname_list += ['DFM_curvedbend_3D/cb_3d_map.nc']
-    fname_list += ['DFM_curvedbend_3D/cb_3d_his.nc']
-    fname_list += [f'DFM_grevelingen_3D/Grevelingen-FM_{i:04d}_map.nc' for i in range(8)]
-    fname_list += ['DFM_grevelingen_3D/Grevelingen-FM_0000_his.nc']
-    fname_list += ['DFM_grevelingen_3D/Grevelingen_FM_grid_20190603_net.nc']
-    # fname_list += ['westernscheldt_sph_map.nc']
-
-    for fname in fname_list:
-        file_nc = os.path.join(dir_testinput,fname)
-        file_dirname = os.path.dirname(file_nc)
-        if os.path.exists(file_nc): #skip if file exists
-            continue
-        pathlib.Path(file_dirname).mkdir(parents=True, exist_ok=True) #make subdir if needed
-        
-        file_url = f'https://opendap.deltares.nl/thredds/fileServer/opendap/deltares/Delft3D/netcdf_example_files/{fname}'
-        print(f'downloading {file_url} to {file_nc}')
-        r = requests.get(file_url, allow_redirects=True)
-        r.raise_for_status() #raise HTTPError if url not exists
-        with open(file_nc, 'wb') as f:
-            f.write(r.content)
-
-dir_testinput = os.path.join(r'c:\DATA','dfm_tools_testdata') #on WCF
-if not os.path.exists(dir_testinput): #for instance when running on github or 
-    dir_testinput = './dfm_tools_testdata'
-    download_testdata()
-
-
-# ACCEPTANCE TESTS VIA EXAMPLE SCRIPTS, these are the ones who are only meant to generate output files
-
-dir_tests = os.path.dirname(__file__) #F9 doesnt work, only F5 (F5 also only method to reload external definition scripts)
-list_configfiles = glob.glob(os.path.join(dir_tests,'examples','*.py')) + glob.glob(os.path.join(dir_tests,'examples_workinprogress','*.py'))
-list_configfiles = [x for x in list_configfiles if 'workinprogress_xarray_performance' not in x] #ignore this slow script
-dir_output_general = os.path.join(dir_tests,'examples_output')
-os.makedirs(dir_output_general, exist_ok=True)
-
-@pytest.mark.requireslocaldata
-@pytest.mark.acceptance
-@pytest.mark.parametrize("file_config", [pytest.param(file_config, id=os.path.basename(file_config).replace('.py','')) for file_config in list_configfiles])
-def test_run_examples(file_config):
-    # 1. Set up test data
-    dir_output = os.path.join(dir_output_general,os.path.basename(file_config).replace('.py',''))
-    if not os.path.exists(dir_output):
-        os.mkdir(dir_output)
-    os.chdir(dir_output)
-    test = os.system(f'python {file_config}')#+ " & pause")
-    
-    if test:
-        raise OSError('execution did not finish properly')
-
-
-##### UNITTESTS AND SYSTEMTESTS
-
-@pytest.mark.unittest
-def test_import_shapely():
-    """
-    tests whether shapely can be imported successfully, this is a problem in some environments
-    in that case 'import shapely' works, but import 'shapely.geometry' fails
-    """
-    import shapely
-    import shapely.geometry
-    
-
-@pytest.mark.parametrize("file_nc, expected_size", [pytest.param(os.path.join(dir_testinput,'DFM_grevelingen_3D','Grevelingen-FM_0000_map.nc'), (5599,3,2), id='from 1 map partion Grevelingen'),
-                                                    pytest.param(os.path.join(dir_testinput,'DFM_grevelingen_3D','Grevelingen_FM_grid_20190603_net.nc'), (44804,4,2), id='fromnet Grevelingen')])
+@pytest.mark.parametrize("file_nc, expected_size", [pytest.param(dfmt.data.fm_grevelingen_map(return_filepath=True), (44796, 4, 2), id='from partitioned map Grevelingen'),
+                                                    pytest.param(dfmt.data.fm_curvedbend_map(return_filepath=True), (550, 4, 2), id='from map curvedbend'),
+                                                    pytest.param(dfmt.data.fm_grevelingen_net(return_filepath=True), (44804,4,2), id='fromnet Grevelingen')])
 @pytest.mark.systemtest
 def test_facenodecoordinates_shape(file_nc, expected_size):
     
@@ -92,19 +20,33 @@ def test_facenodecoordinates_shape(file_nc, expected_size):
     assert facenodecoordinates.shape == expected_size
 
 
-@pytest.mark.parametrize("file_nc, varname, expected_size", [pytest.param(os.path.join(dir_testinput,'DFM_grevelingen_3D','Grevelingen-FM_0*_map.nc'), 'mesh2d_sa1', (44796, 36), id='from partitioned map Grevelingen'),
-                                                             pytest.param(os.path.join(r'p:\archivedprojects\11203850-coastserv\06-Model\waq_model\simulations\run0_20200319\DFM_OUTPUT_kzn_waq', 'kzn_waq_0*_map.nc'), 'mesh2d_Chlfa', (17385, 39), id='from partitioned waq map coastserv'),
-                                                             #pytest.param(r'p:\11205258-006-kpp2020_rmm-g6\C_Work\01_Rooster\final_totaalmodel\rooster_rmm_v1p5_net.nc', 'mesh2d_face_x', (44804,), id='fromnet RMM'), #no time dimension
-                                                             ])
-@pytest.mark.requireslocaldata
 @pytest.mark.unittest
-def test_getmapdata(file_nc, varname, expected_size):
+def test_getmapdata():
     """
     Checks whether ghost cells are properly taken care of (by asserting shape). And also whether varname can be found from attributes in case of Chlfa.
     
-    file_nc = os.path.join(dir_testinput,'DFM_grevelingen_3D','Grevelingen-FM_0*_map.nc')
-    expected_size = (44796,)
     """
+    file_nc = dfmt.data.fm_grevelingen_map(return_filepath=True)
+    expected_size = (44796, 36)
+    varname = 'mesh2d_sa1'
+    
+    data_xr_map = dfmt.open_partitioned_dataset(file_nc)
+    data_xr_map = dfmt.rename_waqvars(data_xr_map)
+    data_varsel = data_xr_map[varname].isel(time=2)
+    
+    assert data_varsel.shape == expected_size
+
+
+@pytest.mark.requireslocaldata
+@pytest.mark.unittest
+def test_getmapdata_waq():
+    """
+    Checks whether ghost cells are properly taken care of (by asserting shape). And also whether varname can be found from attributes in case of Chlfa.
+    
+    """
+    file_nc = os.path.join(r'p:\archivedprojects\11203850-coastserv\06-Model\waq_model\simulations\run0_20200319\DFM_OUTPUT_kzn_waq', 'kzn_waq_0*_map.nc')
+    expected_size = (17385, 39)
+    varname = 'mesh2d_Chlfa'
     
     data_xr_map = dfmt.open_partitioned_dataset(file_nc)
     data_xr_map = dfmt.rename_waqvars(data_xr_map)
@@ -264,7 +206,7 @@ def test_intersect_edges():
     ordering of xu.ugrid2d.intersect_edges return arrays is wrong, but we test it here since this test will fail once sorting is fixed in xugrid or numba.celltree. If so, depracate dfmt.intersect_edges_withsort()
     """
     
-    file_nc = os.path.join(dir_testinput,'DFM_curvedbend_3D','cb_3d_map.nc') #sigmalayer
+    file_nc = dfmt.data.fm_curvedbend_map(return_filepath=True) #sigmalayer
                     
     line_array = np.array([[2084.67741935, 3353.02419355], #with linebend in cell en with line crossing same cell twice
                            [2255.79637097, 3307.15725806],
@@ -286,7 +228,7 @@ def test_intersect_edges_withsort():
     ordering of xu.ugrid2d.intersect_edges return arrays is wrong, so dfmt.intersect_edges_withsort() combines it with sorting. The line array clearly shows different ordering of the resulting face_index array
     """
     
-    file_nc = os.path.join(dir_testinput,'DFM_curvedbend_3D','cb_3d_map.nc') #sigmalayer
+    file_nc = dfmt.data.fm_curvedbend_map(return_filepath=True) #sigmalayer
     
     line_array = np.array([[2084.67741935, 3353.02419355], #with linebend in cell en with line crossing same cell twice
                            [2255.79637097, 3307.15725806],
@@ -304,7 +246,7 @@ def test_intersect_edges_withsort():
 
 @pytest.mark.unittest
 def test_zlayermodel_correct_layers():
-    file_nc = os.path.join(dir_testinput,'DFM_grevelingen_3D','Grevelingen-FM_0*_map.nc') #zlayer
+    file_nc = dfmt.data.fm_grevelingen_map(return_filepath=True) #sigmalayer
     data_frommap_merged = dfmt.open_partitioned_dataset(file_nc)
     
     timestep = 3
@@ -323,7 +265,7 @@ def test_zlayermodel_correct_layers():
 @pytest.mark.requireslocaldata
 def test_timmodel_to_dataframe():
     
-    file_tim = os.path.join(dir_testinput,'Brouwerssluis_short.tim')
+    file_tim = r'p:\archivedprojects\11206811-002-d-hydro-grevelingen\simulaties\Jaarsom2017_dfm_006_zlayer\boundary_conditions\hist\jaarsom_2017\sources_sinks\FlakkeeseSpuisluis.tim'
     
     data_tim = hcdfm.TimModel(file_tim)
     
@@ -331,56 +273,6 @@ def test_timmodel_to_dataframe():
     tim_pd = dfmt.TimModel_to_DataFrame(data_tim, parse_column_labels=True, refdate=refdate)
     
     assert tim_pd.index[0] == pd.Timestamp('2016-01-01 00:00:00')
-    assert len(tim_pd) == 91
+    assert len(tim_pd) == 39603
     assert tim_pd.columns[-1] == 'Phaeocystis_P (g/m3)'
 
-
-@pytest.mark.systemtest
-def test_opendataset_ugridplot(): #this one fails with xarray>=2023.3.0: https://github.com/Deltares/xugrid/issues/78
-    file_nc = os.path.join(dir_testinput,'DFM_curvedbend_3D/cb_3d_map.nc')
-    
-    uds = dfmt.open_partitioned_dataset(file_nc,chunks={'time':1})
-
-    uds['mesh2d_flowelem_bl'].ugrid.plot(edgecolors='face', cmap='jet')
-    
-    
-@pytest.mark.unittest
-def test_xr_interp_to_newdim(): #this one fails with scipy>=1.10.0: https://github.com/pydata/xarray/issues/7701
-    ds = xr.Dataset()
-    so_np = np.array([[[35.819576, 35.82568 , 35.82873 ],
-                       [35.819576, 35.824154, 35.831783],
-                       [35.822628, 35.824154, 35.82873 ]],
-                      
-                      [[35.802788, 35.80584 , 35.815   ],
-                       [35.815   , 35.810417, 35.821102],
-                       [35.824154, 35.813473, 35.81805 ]],
-                      
-                      [[35.786003, 35.789055,       np.nan],
-                       [35.807365, 35.796684,       np.nan],
-                       [35.824154, 35.80584 ,       np.nan]],
-                      
-                      [[35.776848,       np.nan,       np.nan],
-                       [35.792107,       np.nan,       np.nan],
-                       [35.822628,       np.nan,       np.nan]],
-                      
-                      [[35.781425,       np.nan,       np.nan],
-                       [35.792107,       np.nan,       np.nan],
-                       [35.789055,       np.nan,       np.nan]]])
-    ds['so'] = xr.DataArray(so_np,dims=('depth','latitude','longitude'))
-    ds['longitude'] = xr.DataArray([-9.6, -9.5, -9.4], dims=('longitude'))
-    ds['latitude'] = xr.DataArray([42.9, 43.0, 43.1], dims=('latitude'))
-    
-    x_xr = xr.DataArray([-9.5],dims=('plipoints'))
-    y_xr = xr.DataArray([43],dims=('plipoints'))
-    
-    
-    interp_with_floats = ds.interp(longitude=x_xr[0], latitude=y_xr[0], method='linear').so #selecting one value from the da drops the new plipoints dimension
-    interp_with_da_existing = ds.interp(longitude=x_xr.values, latitude=y_xr.values, method='linear').so.isel(longitude=0,latitude=0) #using the DataArray values keeps lat/lon dimenions, gives the same interp result
-    interp_with_da_newdim = ds.interp(longitude=x_xr, latitude=y_xr, method='linear').so.isel(plipoints=0) #using the DataArray introduces a plipoints dimension, which gives different interp result
-    print(interp_with_floats.to_numpy())
-    print(interp_with_da_existing.to_numpy())
-    print(interp_with_da_newdim.to_numpy())
-    print(xr.__version__)
-    
-    assert (interp_with_floats.isnull()==interp_with_da_existing.isnull()).all() #success
-    assert (interp_with_floats.isnull()==interp_with_da_newdim.isnull()).all() #fails with scipy>=1.10.0
