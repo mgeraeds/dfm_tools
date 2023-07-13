@@ -194,3 +194,122 @@ def rename_fouvars(ds:(xr.Dataset,xu.UgridDataset), drop_tidal_times:bool = True
     ds = ds.rename(rename_dict)
     return ds
 
+def inverse_distance_weights(a, b):
+    import numpy as np
+    """
+    Caculate inverse distance weights based and apply using xarray.
+
+    Parameters
+    ----------
+    a : (xr.DataArray,xu.UgridDataArray)
+        Coordinates of faces (dimn_faces, 2)
+    
+    b : (xr.DataArray,xu.UgridDataArray)
+        Coordinates of edges per face (dimn_faces, dimn_face_nodes, 2)
+
+    Returns
+    -------
+    weights : (xr.DataArray)
+        Weights for each of the edge parameters (dimn_faces, dimn_face_nodes)
+
+    """
+    def weight_func(a, b):
+        distance = np.linalg.norm(a[:, np.newaxis, :] - b, axis=-1)
+        weights = distance / np.nansum(distance, axis=1)[:, np.newaxis] # remove this if you only want the distance 
+        return weights
+    
+    weights = xr.apply_ufunc(weight_func, a, b,
+                            input_core_dims=[list(a.dims), list(b.dims)],
+                            output_core_dims=[[a.dims[0], next(iter(set(b.dims) - set(a.dims)))]])
+    return weights 
+
+
+def interpolate_edge2face(uds:(xr.Dataset,xu.UgridDataset), varn_onedges):
+    """
+    Interpolate variables on edges to the faces with inverse distance weighting. 
+
+    Parameters
+    ----------
+    ds : (xr.Dataset,xu.UgridDataset)
+        DESCRIPTION.
+
+    Returns
+    -------
+    ds : TYPE
+        DESCRIPTION.
+
+    """
+    # > Imports
+    import numpy as np
+    import datetime as dt
+
+    # > Determine main dimensions
+    dimn_edges = uds.grid.edge_dimension
+    dimn_faces = uds.grid.face_dimension
+    dimn_maxfn = uds.grid.to_dataset().mesh2d.attrs['max_face_nodes_dimension']
+    mesh2d_var = uds.grid.to_dataset().mesh2d
+
+    # > Get face-edge-connectivity variable name + edge-node-connectivity
+    varn_fnc = uds.grid.to_dataset().mesh2d.attrs['face_node_connectivity']
+    varn_enc = uds.grid.to_dataset().mesh2d.attrs['edge_node_connectivity']
+    varn_fec = 'face_edge_connectivity'
+
+    # > Get face-edge-connectivity in xarray-format
+    face_edges = xr.DataArray(data=uds.grid.face_edge_connectivity, dims=['mesh2d_nFaces', dimn_maxfn], coords=dict(face_edge_connectivity=([uds.grid.face_dimension, dimn_maxfn], uds.ugrid.grid.face_edge_connectivity)), attrs={'cf_role': 'face_edge_connectivity', 'start_index':0, '_FillValue':-1})
+
+    # > Determine where the fill value is used
+    if hasattr(face_edges,'_FillValue'):
+        data_fnc_validbool = face_edges!=face_edges.attrs['_FillValue']
+    else:
+        data_fnc_validbool = None
+
+    interpolation_tstart = dt.datetime.now()
+    print(f'Starting interpolation from edges to faces of variable {varn_onedges}...')
+
+    # > Determine face_edge_connectivity with nan-values where connectivity=-1 (_FillValue)
+    face_coords = xr.DataArray(data=uds.grid.face_coordinates, dims=[dimn_faces, 'Two'], coords=dict(mesh2d_face_x=(dimn_faces, uds.ugrid.grid.face_coordinates[:,0]),mesh2d_face_y=(dimn_faces, uds.grid.face_coordinates[:,1]))) # uds.grid.face_coordinates
+    edge_coords = xr.DataArray(data=uds.grid.edge_coordinates, dims=[dimn_edges, 'Two'], coords=dict(mesh2d_edge_x=(dimn_edges, uds.ugrid.grid.edge_coordinates[:,0]), mesh2d_edge_y=(dimn_edges, uds.grid.edge_coordinates[:,1]))) # uds.grid.edge_coordinates
+    face_edge_x_coords = xr.where(face_edges!=face_edges.attrs['_FillValue'], edge_coords[:,0][face_edges], np.nan)
+    face_edge_y_coords = xr.where(face_edges!=face_edges.attrs['_FillValue'], edge_coords[:,1][face_edges], np.nan) # change xr --> np if working with numpy arrays
+
+    # > Stack the edge coordinates the right way (with nan-values)
+    face_edge_coords = xr.combine_nested([face_edge_x_coords, face_edge_y_coords], concat_dim='Two').transpose('mesh2d_nFaces',  'mesh2d_nMax_face_nodes', 'Two')
+    
+    # > Determine weights based on inverse distances
+    weights_fe = inverse_distance_weights(face_coords, face_edge_coords)
+
+    ## >> Actual interpolation
+    #------------------------------------
+    # > Step 1: select all edge values corresponding to one face
+    print('Working on step 1: selecting all edge values...')
+    edgevar_tofaces_onint_step1 = uds[varn_onedges].isel({dimn_edges:face_edges})
+    # > Step 2: replace non-existent edges with nan's
+    print('Working on step 2: replacing non-existent edges with NaN values...')
+    edgevar_tofaces_onint_step2 = edgevar_tofaces_onint_step1.where(data_fnc_validbool)
+    print('Working on step 3: using inverse-distance weighting to calculate face values...')
+    # > Step 3: use inverse-distance weighting to calculate face values
+    edgevar_tofaces_onint = (edgevar_tofaces_onint_step2 * weights_fe).sum(axis=2)
+
+    ## > Interpolate from interfaces to layers
+    #------------------------------------------
+    if hasattr(mesh2d_var,'interface_dimension'):
+        print('Working on step 4: average from interfaces to layers (3D model)...')
+        dimn_interface = mesh2d_var.attrs['interface_dimension']
+        dimn_layer = mesh2d_var.attrs['layer_dimension']
+
+        # > select all top interfaces and all bottom interfaces, sum, divide by two (same as average)
+        edgevar_tofaces_topint = edgevar_tofaces_onint.isel({dimn_interface:slice(1,None)})
+        edgevar_tofaces_botint = edgevar_tofaces_onint.isel({dimn_interface:slice(None,-1)})
+        edgevar_tofaces = (edgevar_tofaces_topint + edgevar_tofaces_botint)/2
+
+        # > rename int to lay dimension and re-assign variable attributes
+        edgevar_tofaces = edgevar_tofaces.rename({dimn_interface:dimn_layer}).assign_attrs(edgevar_tofaces_onint_step1.attrs)
+    else:
+        edgevar_tofaces = edgevar_tofaces_onint
+
+    ## > Add to dataset
+    #------------------------------------
+    uds[varn_onedges] = edgevar_tofaces
+    print(f'Interpolation from edges to faces finished in {dt.datetime.now() - interpolation_tstart}')
+
+    return uds
